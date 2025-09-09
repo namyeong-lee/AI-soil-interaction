@@ -334,6 +334,9 @@ class ExcEnv(DirectRLEnv):
     # post-physics step calls    
     def _apply_action(self):
         #body_ids = torch.full_like(torch.arange(self.num_envs), self.base_idx, dtype=torch.int32, device=self.device)
+
+        self.writer.add_scalar("tau_base", torch.max(self.tau_base), self.count_steps)
+        
         #self._robot.set_external_force_and_torque(self.tau_base[:,:3][:,None,:], self.tau_base[:,3:][:,None,:], body_ids=self.base_idx)
         
         #self.torque[:,[1,2]] = torch.zeros((self.num_envs,2), device=self.device)
@@ -399,7 +402,7 @@ class ExcEnv(DirectRLEnv):
         
         # if self.count_steps % 1000 ==0:
         #     a=1.
-        #     self.writer.close()
+        #     
         # else:
         #     a=0.    
         
@@ -545,9 +548,14 @@ class ExcEnv(DirectRLEnv):
         cabin_ang = axis_angle_from_quat(cabin_ang)[:,1]
         self.cabin_pos = (self._robot.data.body_pos_w[list(range(0, self.num_envs)), self.cabin_idx] - self.scene.env_origins)[:,[0,2]]
         
-        cabin_ang_rate = cabin_ang / -self.arm_direction_angle(self.cabin_pos, self.tip_pos).clamp_min(1e-9)
+        
+        cab_denom = -self.arm_direction_angle(self.cabin_pos, self.tip_pos)
+        cab_denom = torch.where(cab_denom.abs() < 1e-9, 1e-9 * torch.sign(cab_denom), cab_denom)
+        cabin_ang_rate = cabin_ang / cab_denom
         
         self.ang_tip_plate = self.tip_ang+torch.atan2(self.tip_lin_vel[:,1], self.tip_lin_vel[:,0])
+        
+        print(self.tip_lin_vel)
         
         self.fill_ratio = self.compute_fill_ratio(self.tip_pos)
         self.pre_tip_pos = self.tip_pos
@@ -605,9 +613,9 @@ class ExcEnv(DirectRLEnv):
         # self.writer.add_scalar("arm/velocity", self._robot.data.joint_vel[0][1], self.count_steps)
         # self.writer.add_scalar("bucket/velocity", self._robot.data.joint_vel[0][2], self.count_steps)
         
-        self.writer.add_scalar("boom/velocity", self.torque[0][0], self.count_steps)
-        self.writer.add_scalar("arm/velocity", self.torque[0][1], self.count_steps)
-        self.writer.add_scalar("bucket/velocity", self.torque[0][2], self.count_steps)
+        # self.writer.add_scalar("boom/velocity", self.torque[0][0], self.count_steps)
+        # self.writer.add_scalar("arm/velocity", self.torque[0][1], self.count_steps)
+        # self.writer.add_scalar("bucket/velocity", self.torque[0][2], self.count_steps)
         
         error = desired_vel - self._robot.data.joint_vel
         self.integral_error = self.integral_error + error * self.dt
@@ -715,39 +723,65 @@ class ExcEnv(DirectRLEnv):
         L = torch.where(torch.isnan(intersec_x) & (bkt[:, 1] <= self.soil_height), self.max_L, L)
         L = torch.clamp(L, max=self.max_L)
         
-        PO = self.P_cord - bkt
-        beta = torch.atan2(PO[:,1], PO[:,0]) # angle between ground and bucket
+        PO = bkt - self.P_cord
+        beta = -torch.atan2(PO[:,1], PO[:,0]) # angle between ground and bucket
         #beta = -torch.atan2(b[:,1],b[:,0]) 
         beta = torch.where(torch.isnan(intersec_x), torch.zeros_like(beta), beta)
         
         lo = (torch.pi/4 - (self.sifa + self.sbfa)/2) + (torch.pi/4 - beta/2)
-        area_abc = 0.5 * L * torch.sin(beta) * (L * torch.cos(beta) + L * torch.sin(beta) / torch.tan(lo).clamp_min(1e-9))
+        
+        abc_denom = torch.tan(lo)
+        abc_denom = torch.where(abc_denom.abs() < 1e-9, 1e-9 * torch.sign(abc_denom), abc_denom)
+        area_abc = 0.5 * L * torch.sin(beta) * (L * torch.cos(beta) + L * torch.sin(beta) / abc_denom)
         area_abx = 0.5 * torch.abs(bkt[:,0]*sep_plate_sur[:,1]+sep_plate_sur[:,0]*up_plate_sur[:,1]+up_plate_sur[:,0]*bkt[:,1] 
                                    - (bkt[:,0]*up_plate_sur[:,1]+up_plate_sur[:,0]*sep_plate_sur[:,1]+sep_plate_sur[:,0]*bkt[:,1]))
         area_abc = torch.where(bkt[:, 1] > self.soil_height, torch.zeros_like(area_abc), area_abc)
         area_abx = torch.where(bkt[:, 1] > self.soil_height, torch.zeros_like(area_abx), area_abx)
         area_abx = torch.clamp(area_abx, max = 0.423)
+        area_abc = area_abc.abs()
+        area_abx = area_abx.abs()
         
         area_bcx = torch.abs(area_abc - area_abx)
         
         c_s = (self.c_a * area_abx + self.c * area_bcx) / area_abc.clamp_min(1e-9)
         sifa_s = (self.sbfa * area_abx + self.sifa * area_bcx) / area_abc.clamp_min(1e-9)
-        z = -L/3*((torch.cos(beta)+torch.sin(beta)/torch.tan(lo))*(-torch.square(torch.sin(beta))))/(torch.sin(beta)*(torch.cos(beta)+torch.sin(beta)/torch.tan(lo).clamp_min(1e-9))).clamp_min(1e-9)
+        
+        z_denom1 = torch.tan(lo)
+        z_denom1 = torch.where(z_denom1.abs() < 1e-9, 1e-9 * torch.sign(z_denom1), z_denom1)
+        
+        z_denom2 = (torch.sin(beta)*(torch.cos(beta)+torch.sin(beta)/z_denom1))
+        z_denom2 = torch.where(z_denom2.abs() < 1e-9, 1e-9 * torch.sign(z_denom2), z_denom2)
+        
+        z = -L/3*((torch.cos(beta)+torch.sin(beta)/torch.tan(lo))*(-torch.square(torch.sin(beta)))) / z_denom2
         ADF = self.c_a * self.B * L
-        W = self.uw * self.B * (0.5 * L * torch.sin(beta) * (L * torch.cos(beta) + L * torch.sin(beta) / torch.tan(lo).clamp_min(1e-9)))
-        CF = self.c * self.B * L * torch.sin(beta) / torch.sin(lo).clamp_min(1e-9)
-        ACF = 0.5 * c_s * (L**2) * torch.sin(beta) * (torch.cos(beta) + torch.sin(beta)/torch.tan(lo).clamp_min(1e-9))
-        SF = 0.5 * K * self.uw * z * torch.tan(sifa_s) * torch.square(L) * torch.sin(beta) * (torch.cos(beta)+ torch.sin(beta) / torch.tan(lo).clamp_min(1e-9))
+        
+        W_denom = torch.tan(lo)
+        W_denom = torch.where(W_denom.abs() < 1e-9, 1e-9 * torch.sign(W_denom), W_denom)
+        W = self.uw * self.B * (0.5 * L * torch.sin(beta) * (L * torch.cos(beta) + L * torch.sin(beta) / W_denom))
+        
+        CF_denom = torch.sin(lo)
+        CF_denom = torch.where(CF_denom.abs() < 1e-9, 1e-9 * torch.sign(CF_denom), CF_denom)
+        CF = self.c * self.B * L * torch.sin(beta) / CF_denom
+        
+        ACF_denom = torch.tan(lo)
+        ACF_denom = torch.where(ACF_denom.abs() < 1e-9, 1e-9 * torch.sign(ACF_denom), ACF_denom)
+        ACF = 0.5 * c_s * (L**2) * torch.sin(beta) * (torch.cos(beta) + torch.sin(beta)/ACF_denom)
+        
+        SF_denom = torch.tan(lo)
+        SF_denom = torch.where(SF_denom.abs() < 1e-9, 1e-9 * torch.sign(SF_denom), SF_denom)
+        SF = 0.5 * K * self.uw * z * torch.tan(sifa_s) * torch.square(L) * torch.sin(beta) * (torch.cos(beta)+ torch.sin(beta) / SF_denom)
 
         R_s = (-ADF * torch.cos(beta+lo+self.sifa) + W * torch.sin(lo+self.sifa) + CF * torch.cos(self.sifa) + 2 * ACF * torch.cos(self.sifa) + 2 * SF * torch.cos(self.sifa)) / torch.sin(beta+lo+self.sbfa+self.sifa).clamp_min(1e-9)
-
+        
         #center_z = torch.norm(PO, dim=-1) / 2
         center_z = L / 2
         p_n = 0.5 * self.uw * center_z*((1+K) + (1-K)*torch.cos(2*beta))
 
         p = self.cpf * p_n
         R_ps = (self.c_a + p_n * torch.tan(self.sbfa)) * self.B * L
-        R_pt = self.n * (p + (self.c_a + p * torch.tan(self.sifa)) * (1 / torch.tan(torch.tensor(self.alpha, device=self.device)).clamp_min(1e-9))) * self.A_t
+        R_pt_denom = torch.tan(torch.tensor(self.alpha, device=self.device))
+        R_pt_denom = torch.where(R_pt_denom.abs() < 1e-9, 1e-9 * torch.sign(R_pt_denom), R_pt_denom)
+        R_pt = self.n * (p + (self.c_a + p * torch.tan(self.sifa)) * (1 / R_pt_denom)) * self.A_t
         
         R_p = R_ps + R_pt
         R_p = R_p * torch.cos(self.ang_tip_plate)
@@ -765,7 +799,6 @@ class ExcEnv(DirectRLEnv):
 
         EO = self.tip_pos2 -bkt
         d1 = EO / (EO.norm(dim=-1, keepdim=True).clamp_min(1e-9))
-        
         
         Fs = n * R_s.unsqueeze(-1)
         Fp = d1 * R_p.unsqueeze(-1)
