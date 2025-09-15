@@ -25,6 +25,8 @@ from isaaclab.utils.math import sample_uniform, axis_angle_from_quat, quat_from_
 from scipy.spatial.transform import Rotation as R
 from torch.utils.tensorboard import SummaryWriter
 import omni.physics.tensors as tensors
+import matplotlib.pyplot as plt
+
 
 @configclass
 class ExcEnvCfg(DirectRLEnvCfg):
@@ -244,7 +246,7 @@ class ExcEnv(DirectRLEnv):
         self.max_step = self.cfg.episode_length_s / self.dt
         self.pre_fill_ratio = torch.zeros(self.num_envs, device=self.device)
         self.pre_actions = torch.zeros((self.num_envs, 3), device=self.device)
-        self.count_steps, self.tip_pos, self.tip_lin_vel, self.cabin_pos, self.base_pos, self.tip_pos2, self.tip_pos3, self.tip_ang, self.circle_mid  = 0., 0.,0.,0.,0.,0.,0., 0., 0.
+        self.count_steps, self.tip_pos, self.tip_lin_vel, self.cabin_pos, self.base_pos, self.tip_pos2, self.tip_pos3, self.tip_ang, self.tip_ang2, self.circle_mid  = 0., 0., 0.,0.,0.,0.,0.,0., 0., 0.
         self.tip_ang_vel, self.ang_tip_plate, self.cabin_lin_vel, self.boom_ang, self.arm_ang, self.buck_ang = 0.,0.,0.,0.,0.,0.
         self.kj, self.nc1, self.nc2, self.nc3, self.nc4, self.nc5, self.nc6 = 0.,0.,0.,0.,0.,0.,0.
         self.fill_terminal_reward, self.close_terminal_reward = 0., 0.
@@ -315,12 +317,6 @@ class ExcEnv(DirectRLEnv):
     # pre-physics step calls
     def _pre_physics_step(self, actions: torch.Tensor):
         self.actions =  actions.clone()
-        # self.actions = 0.5 * (self.actions + 1.0) * (self.v_max - self.v_min) + self.v_min
-        # self.actions = torch.full_like(self._robot.data.joint_vel, 0.5, dtype=torch.float32)
-        # self.actions[:, 0] = torch.ones(self.num_envs) *0.3
-        # self.actions[:, 1] = torch.ones(self.num_envs) *-0.5
-        # self.actions[:, 2] = torch.ones(self.num_envs) *-0.6
-        
         self.actions[:,0] = torch.clamp(self.actions[:,0], -0.3, 0.3)
         self.actions[:,1] = torch.clamp(self.actions[:,1], -0.5, 0.5)
         self.actions[:,2] = torch.clamp(self.actions[:,2], -0.6, 0.6)
@@ -333,42 +329,9 @@ class ExcEnv(DirectRLEnv):
         
     # post-physics step calls    
     def _apply_action(self):
-        #body_ids = torch.full_like(torch.arange(self.num_envs), self.base_idx, dtype=torch.int32, device=self.device)
-
-        self.writer.add_scalar("tau_base", torch.max(self.tau_base), self.count_steps)
-        
+        #self.writer.add_scalar("tau_base", torch.max(self.tau_base), self.count_steps)
         #self._robot.set_external_force_and_torque(self.tau_base[:,:3][:,None,:], self.tau_base[:,3:][:,None,:], body_ids=self.base_idx)
-        
-        #self.torque[:,[1,2]] = torch.zeros((self.num_envs,2), device=self.device)
-        # self.torque[:,0] = torch.ones(self.num_envs) * -10000000.
-        # self.torque[:,1] = torch.ones(self.num_envs) * -1000000.
-        # self.torque[:,2] = torch.ones(self.num_envs) * -100000.
         self._robot.set_joint_effort_target(self.torque)
-        #self._robot.set_joint_effort_target(torch.tensor([[-1000.,1000,1000],[1000.,-1000,-1000],[1000.,-1000,-1000],[1000.,-1000,-1000],[-1000.,1000,1000]]))
-        #self._robot.set_joint_effort_target(torch.tensor([[-1000.,-1000,-1000]]))
-        
-        #self._robot.set_joint_effort_target(torch.tensor([[150000.,-1050000.,-1050000.],[1500000.,-1050000.,-1050000.],[1500000.,1050000.,-1050000.]]))
-        
-        # rb_f = torch.zeros((self.num_envs, 1, 3), device=self.device)
-        # rb_tau = torch.zeros_like(rb_f)
-        # #rb_f[:,0] = torch.tensor([0., 0., -470000.], device=self.device)
-        # rb_f[:,0] = torch.tensor([-3000000., 0., 2500000.], device=self.device)
-        # self._robot.set_external_force_and_torque(rb_f, rb_tau, body_ids=self.buck_idx)
-        
-        # rb_f = torch.zeros((self.num_envs, 1, 3), device=self.device)
-        # rb_tau = torch.zeros_like(rb_f)
-        # rb_f[:,0] = torch.tensor([2500000., 0., 0.], device=self.device)
-        # rb_f1 = torch.zeros((self.num_envs, 1, 3), device=self.device)
-        # rb_tau1 = torch.zeros_like(rb_f1)
-        # rb_f1[:,0] = torch.tensor([0., 0., -2500000], device=self.device)
-        # pos = torch.zeros((self.num_envs, 1, 3), device=self.device)
-        # pos[:,0] = torch.tensor([10., 0., 0.], device=self.device)
-        # pos1 = torch.zeros((self.num_envs, 1, 3), device=self.device)
-        # pos1[:,0] = torch.tensor([0., 0., 0.], device=self.device)
-        # self._robot.set_external_force_and_torque(rb_f, rb_tau, positions=pos, body_ids=self.buck_idx)
-        
-        # print(rb_f1.shape, rb_tau1.shape, self.tip_idx)
-        # self._robot.set_external_force_and_torque(rb_f1, rb_tau1, positions=pos1, body_ids=self.tip_idx)
         return
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -380,7 +343,7 @@ class ExcEnv(DirectRLEnv):
         self.epi_step += 1
         
         self.nc1 = torch.norm(self.tip_lin_vel, dim=-1) > 0.5
-        self.nc2 = self.ang_tip_plate < 0.
+        self.nc2 = (self.ang_tip_plate < 0.) & ((self.soil_height - self.tip_pos[:,1]) < 0.)
         self.nc3 = torch.norm(cabin_lin_vel, dim=-1) > 0.1
         self.nc4 = (self.fill_ratio == 0.) & ((self.tip_pos[:,1] - self.soil_height) > 0.5)
         self.nc5 = ((self.tip_pos[:,0] > -2.5) & ((self.cabin_pos[:,1] + 2.) > self.tip_pos[:,1])) | (self.boom_ang <= self.joint_lower_limits[0]) | (self.boom_ang >= self.joint_upper_limits[0]) | (self.arm_ang <= self.joint_lower_limits[1]) | (self.arm_ang >= self.joint_upper_limits[1]) | (self.buck_ang <= self.joint_lower_limits[2]) | (self.buck_ang >= self.joint_upper_limits[2])
@@ -389,7 +352,7 @@ class ExcEnv(DirectRLEnv):
         pc1 = self.fill_ratio > self.kj * 0.68 + 0.3
         pc2 = torch.norm(self.cabin_pos - self.tip_pos, dim=-1) < 3.0
         pc3 = (self.tip_pos[:,1] - self.soil_height) > self.kj * 0.7 + 0.3
-        pc4 = (self.tip_ang + 1.0388) < 0.3
+        pc4 = (self.tip_ang2 + 1.0388) < 0.3
         pc5 = buck_pos[:,1] > self.tip_pos[:,1]
         
         positive_terminations = torch.where((pc1 | pc2) & pc3 & pc4 & pc5, 1., 0.)
@@ -407,6 +370,7 @@ class ExcEnv(DirectRLEnv):
         #     a=0.    
         
         # return torch.tensor([a]*self.num_envs), torch.tensor([a]*self.num_envs)
+        
         return positive_terminations, negative_terminations
 
     def _get_rewards(self) -> torch.Tensor:
@@ -414,7 +378,7 @@ class ExcEnv(DirectRLEnv):
         c1 = self.fill_ratio > (self.kj * 0.6 + 0.3)
         c2 = torch.norm(self.cabin_pos - self.tip_pos, dim=-1) < 3.0
         c3 = (self.tip_pos[:,1] - self.soil_height) > 1.0
-        c4 = (self.tip_ang + 1.0388) < 0.3
+        c4 = (self.tip_ang2 + 1.0388) < 0.3
         c5 = torch.norm(self.tip_lin_vel, dim=-1) < 0.4
         
         move_down = torch.where((self.fill_ratio <0.05) & c5, -0.1*self.tip_lin_vel[:,1], 0.)
@@ -430,10 +394,11 @@ class ExcEnv(DirectRLEnv):
         self.pre_actions = self.actions
         
         reward = move_down + filling + move_up + curl + smooth
-        reward = torch.where(self.nc1 | self.nc2 | self.nc3 | self.nc4 | self.nc5 | self.nc6, -1., reward)
+        reward = torch.where(self.nc1 | self.nc2 | self.nc3 | self.nc4 | self.nc5 | self.nc6, reward-1., reward)
         
         total_reward = reward + self.fill_terminal_reward + self.close_terminal_reward
         
+        self.writer.add_scalar("reward_mean", torch.mean(total_reward), self.count_steps)
         return total_reward
 
     def _reset_idx(self, env_ids: torch.Tensor | None):
@@ -444,17 +409,16 @@ class ExcEnv(DirectRLEnv):
         # self._robot.write_root_pose_to_sim(torch.cat((self.fixed_pos, ang), dim=-1), env_ids=env_ids)
         # self.object.write_root_pose_to_sim(torch.cat((self.obj_pos, ang), dim=-1), env_ids=env_ids)
         
-        # #boom_ang = sample_uniform(-0.5, -0.5, (len(env_ids), 1), self.device)
-        # #arm_ang = sample_uniform(-0.1, -0.1, (len(env_ids), 1), self.device)
+        # boom_ang = sample_uniform(-0.1, -0.1, (len(env_ids), 1), self.device)
+        # arm_ang = sample_uniform(-0.1, -0.1, (len(env_ids), 1), self.device)
         # buck_ang = sample_uniform(-0.1, -0.1, (len(env_ids), 1), self.device)
-        # boom_ang = sample_uniform(-1.56, -1.56, (len(env_ids), 1), self.device)
-        # arm_ang = sample_uniform(-2.08, -2.08, (len(env_ids), 1), self.device)
+        # # boom_ang = sample_uniform(-1.56, -1.56, (len(env_ids), 1), self.device)
+        # # arm_ang = sample_uniform(-2.08, -2.08, (len(env_ids), 1), self.device)
         # #buck_ang = sample_uniform(-2.96, -2.96, (len(env_ids), 1), self.device)
         # joint_pos = torch.cat((boom_ang, arm_ang, buck_ang),-1)
         # joint_vel = torch.zeros_like(joint_pos)
         # self._robot.set_joint_position_target(joint_pos, env_ids=env_ids)
         # self._robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
-        # self.scene.update(dt=self.physics_dt)
         
         # robot state
         cab_ang = sample_uniform(-0.1, 0.1, len(env_ids), self.device)
@@ -525,7 +489,8 @@ class ExcEnv(DirectRLEnv):
         self.sbfa[env_ids] = sample_uniform(0.2, 0.4, (len(env_ids)), self.device)
         self.cpf[env_ids] = sample_uniform(0, 300, (len(env_ids)), self.device)
         self.max_L[env_ids] = torch.full_like(self.c[env_ids], self.plate_height, dtype=torch.float32)
-        self.P_cord[env_ids] = torch.zeros_like(self.pre_tip_pos[env_ids])
+
+        self.P_cord[env_ids] = (self._robot.data.body_pos_w[env_ids, self.tip2_idx] - self.scene.env_origins[env_ids])[:,[0,2]]
         
 
     def _get_observations(self) -> dict:
@@ -539,8 +504,8 @@ class ExcEnv(DirectRLEnv):
         self.tip_pos3 = (self._robot.data.body_pos_w[list(range(0, self.num_envs)), self.tip3_idx] - self.scene.env_origins)[:,[0,2]]
         self.circle_mid = (self._robot.data.body_pos_w[list(range(0, self.num_envs)), self.circle_mid_idx] - self.scene.env_origins)[:,[0,2]]
         
-        
         self.tip_ang = -self.batch_angle_xz(self.tip_pos2,self.tip_pos)
+        self.tip_ang2 = -self.batch_angle_xz(self.tip_pos3,self.tip_pos)
         self.tip_lin_vel = self._robot.data.body_lin_vel_w[list(range(0, self.num_envs)), self.tip_idx][:,[0,2]]
         self.tip_ang_vel = self._robot.data.body_ang_vel_w[list(range(0, self.num_envs)), self.tip_idx][:,1]
   
@@ -555,12 +520,16 @@ class ExcEnv(DirectRLEnv):
         
         self.ang_tip_plate = self.tip_ang+torch.atan2(self.tip_lin_vel[:,1], self.tip_lin_vel[:,0])
         
-        print(self.tip_lin_vel)
-        
         self.fill_ratio = self.compute_fill_ratio(self.tip_pos)
         self.pre_tip_pos = self.tip_pos
         
+        
         self.soil_force()
+        
+        
+        print(self.fill_ratio[0])
+        print(self.P_cord[0], self.tip_pos2[0], self.tip_pos[0], self.soil_height[0])
+        print("------------------------------------------------")
         
         obs = torch.cat(
             (   
@@ -641,6 +610,7 @@ class ExcEnv(DirectRLEnv):
         depth = (self.soil_height - height).clamp(min=0.0)
         
         swept_volume = delta_dist * self.plate_width * depth
+        swept_volume = torch.where(self.ang_tip_plate < 0., 0., swept_volume)
     
         self.total_swept = self.total_swept + swept_volume
         
@@ -695,23 +665,6 @@ class ExcEnv(DirectRLEnv):
     def soil_force(self):
         K = 1-torch.sin(self.sifa)
         bkt = self.tip_pos
-        # bkt2 = self.tip_pos2
-        # bkt3 = self.tip_pos3
-        # dx = bkt2[:, 0]-bkt[:, 0]
-        # dx1 = bkt3[:, 0]-bkt[:, 0]
-        
-        # dx = torch.where(dx.abs()<1e-9, 1e-9, dx)
-        # dx1 = torch.where(dx1.abs()<1e-9, 1e-9, dx1)
-        
-        # gradient = (bkt2[:, 1]-bkt[:, 1]) / dx
-        # gradient1 = (bkt3[:, 1]-bkt[:, 1]) / dx1
-        
-        # dx2 = 1 - gradient * torch.tan(self.solve_theta)
-        # dx2 = torch.where(dx2.abs()<1e-9, 1e-9, dx2)
-        # new_gradient = (gradient + torch.tan(self.solve_theta)) / dx2
-        
-        # intersec_x = ((self.soil_height-bkt[:, 1]) / new_gradient) + bkt[:, 0]
-        # intersec_x1 = ((self.soil_height-bkt[:, 1]) / gradient1) + bkt[:, 0]
         
         intersec_x, intersec_x1 = self.get_intersect()
         
@@ -824,6 +777,8 @@ class ExcEnv(DirectRLEnv):
         Fp_y = torch.zeros((self.num_envs, 1), dtype=torch.float32, device=self.device)
         Fp = torch.cat((Fp[:,0].unsqueeze(-1), Fp_y, Fp[:,1].unsqueeze(-1)), dim=-1)[:,None,:]
         
+        print(Fs_pos[0], (self.P_cord + bkt)[0] / 2)
+        
         total_f = torch.cat((rotated_Fs, Fp), dim=1)
         total_pos = torch.cat((Fs_pos, Fp_pos), dim=1)
         
@@ -836,44 +791,6 @@ class ExcEnv(DirectRLEnv):
         self.tau_joints = tau_gen[:, 6:]   # (B,n)
         
         return rotated_Fs, Fp
-
-    # def A_of_theta(self, theta):
-    #     # P on arc
-    #     R = self.bucket_circle
-    #     E = self.tip_pos2
-    #     C = self.circle_mid
-    #     O = self.tip_pos
-    #     P = C + torch.stack([R*torch.cos(theta), R*torch.sin(theta)], dim=-1)
-    #     EO = E - O
-    #     PO = P - O
-    #     Atr = 0.5*(EO[..., 0]*PO[..., 1] - EO[..., 1]*PO[..., 0]).abs()
-    #     EC = E - C
-    #     dtheta = theta - torch.atan2(EC[:,1], EC[:,0])
-    #     dtheta = torch.clamp(dtheta, min=0.0)
-    #     Aseg =  0.5 * (R**2) * (dtheta - torch.sin(dtheta))
-    #     return Atr + Aseg, P
-
-    # def solve_theta(self, iters=30, eps=1e-7):
-    #     EC = self.tip_pos2 - self.circle_mid
-    #     theta_E = torch.atan2(EC[:,1], EC[:,0])
-    #     A_tgt = self.fill_ratio.clone()
-    #     low  = theta_E
-    #     high = theta_E + torch.pi
-
-    #     while True:
-    #         mid = 0.5*(low + high)
-    #         A_mid, P = self.A_of_theta(mid)
-    #         go_left = (A_mid >= A_tgt)  # monotone increasing
-    #         high = torch.where(go_left, mid, high)
-    #         low  = torch.where(go_left, low, mid)
-    #         done = (high - low).abs() < eps
-            
-    #         self.max_L = torch.norm(P, dim=-1)
-    #         self.P_cord = P
-            
-    #         if done.all(): break
-        
-    #     return 0.5*(low + high)  # θ*
     
     def get_intersect(self):
         self.solve_theta()
@@ -931,153 +848,125 @@ class ExcEnv(DirectRLEnv):
         
         return intersec_x, intersec_x1
     
-    def _cross2(self, a, b):
+    def cross2(self, a, b):
+        # a,b: [...,2]
         return a[..., 0]*b[..., 1] - a[..., 1]*b[..., 0]
-
-    def _cbrt(self, x):
-        return torch.sign(x) * torch.pow(torch.abs(x).clamp_min(1e-12), 1.0/3.0)
     
-        # 기존의 A_of_theta는 그대로 사용
-    def A_of_theta(self, theta):
-        R = self.bucket_circle
-        E = self.tip_pos2
-        C = self.circle_mid
-        O = self.tip_pos
-        P = C + torch.stack([R*torch.cos(theta), R*torch.sin(theta)], dim=-1)
-        EO = E - O
-        PO = P - O
-        Atr = 0.5*(self._cross2(EO, PO)).abs()
-        EC = E - C
-        dtheta = theta - torch.atan2(EC[:,1], EC[:,0])
-        dtheta = torch.clamp(dtheta, min=0.0)
-        Aseg = 0.5 * (R**2) * (dtheta - torch.sin(dtheta))
-        return Atr + Aseg, P
+    def ensure_B(self, x, B, device, dtype):
+        """x -> [B] 텐서로 강제"""
+        t = torch.as_tensor(x, device=device, dtype=dtype)
+        if t.ndim == 0:             # scalar(float 등)
+            t = t.expand(B)         # [B] (view)
+        elif t.ndim == 1 and t.shape[0] == B:
+            pass
+        else:
+            raise ValueError(f"Expected scalar or [B], got {tuple(t.shape)}")
+        return t
 
-    # === (1) θ_E 주변 3차 근사 계수(폐형) ===
-    def _cubic_coeffs_initial(self):
-        O, E, C = self.tip_pos, self.tip_pos2, self.circle_mid
-        R = self.bucket_circle
-        ex, ey = (E - O)[..., 0], (E - O)[..., 1]
-        EC = E - C
-        theta_E = torch.atan2(EC[:,1], EC[:,0])
-        cE, sE = torch.cos(theta_E), torch.sin(theta_E)
-        gamma = 0.5 * R * (ex*cE + ey*sE)                  # A'(θ_E)
-        beta  = -0.25 * R * (ex*sE - ey*cE)                # 1/2 A''(θ_E)
-        alpha = (R**2)/12.0 - gamma/6.0                    # 1/6 A'''(θ_E) 근사
-        return alpha, beta, gamma, theta_E
+    def ensure_B2(self, x, B, device, dtype):
+        """x -> [B,2] 텐서로 강제"""
+        t = torch.as_tensor(x, device=device, dtype=dtype)
+        if t.ndim == 1 and t.shape[0] == 2:        # [2]
+            t = t.unsqueeze(0).expand(B, 2)        # [B,2]
+        elif t.ndim == 2 and t.shape[0] == B and t.shape[1] == 2:
+            pass
+        else:
+            raise ValueError(f"Expected [2] or [B,2], got {tuple(t.shape)}")
+        return t
 
-    # === (2) θ_max 주변 3차 근사 계수(정확 도함수 기반) ===
-    def _derivs_at(self, theta0):
-        # A'(θ), A''(θ), A'''(θ)  (삼각형 항의 abs는 sign(cross)로 처리)
-        R = self.bucket_circle
-        O, E, C = self.tip_pos, self.tip_pos2, self.circle_mid
-
-        cos0, sin0 = torch.cos(theta0), torch.sin(theta0)
-        P0   = C + torch.stack([R*cos0, R*sin0], dim=-1)
-        P1   = torch.stack([-R*sin0, R*cos0], dim=-1)      # dP/dθ
-        P2   = torch.stack([-R*cos0, -R*sin0], dim=-1)     # d2P/dθ2
-        P3   = -P1                                         # d3P/dθ3
-
-        EO = E - O
-        S0 = self._cross2(EO, P0 - O)                           # 부호 있는 cross
-        sgn = torch.sign(S0)
-        sgn = torch.where(sgn == 0, torch.ones_like(sgn), sgn)
-
-        # 삼각형 항 도함수들
-        T1 = 0.5 * sgn * self._cross2(EO, P1)
-        T2 = 0.5 * sgn * self._cross2(EO, P2)
-        T3 = 0.5 * sgn * self._cross2(EO, P3)
-
-        # 세그먼트 항 도함수들 (θ0 >= θ_E 가정)
-        EC = E - C
-        theta_E = torch.atan2(EC[:,1], EC[:,0])
-        d0 = (theta0 - theta_E).clamp_min(0.0)
-        S1 = 0.5 * (R**2) * (1.0 - torch.cos(d0))
-        S2 = 0.5 * (R**2) * torch.sin(d0)
-        S3 = 0.5 * (R**2) * torch.cos(d0)
-
-        A1 = T1 + S1
-        A2 = T2 + S2
-        A3 = T3 + S3
-        return A1, A2, A3
-
-    # === (3) 카르다노: α x^3 + β x^2 + γ x - A = 0 의 실해 ===
-    def _cardano(self, alpha, beta, gamma, A_rhs):
-        a = alpha.clamp_min(1e-12)
-        b = beta
-        g = gamma
-        # x = y - b/(3a);   y^3 + p y + q = 0
-        shift = b / (3.0*a)
-        p = (3*a*g - b*b) / (3*a*a)
-        q = (27*a*a*(-A_rhs) - 9*a*b*g + 2*b**3) / (27*a**3)
-        half_q = 0.5*q
-        third_p = p/3.0
-        Delta = half_q*half_q + third_p*third_p*third_p
-        y = torch.empty_like(p)
-
-        mask = (Delta >= 0)
-        if mask.any():
-            sqrtD = torch.sqrt(Delta[mask])
-            y1 = self._cbrt(-half_q[mask] + sqrtD)
-            y2 = self._cbrt(-half_q[mask] - sqrtD)
-            y[mask] = y1 + y2
-        if (~mask).any():
-            pm = p[~mask]
-            qm = q[~mask]
-            r = torch.sqrt((-pm/3.0).clamp_min(1e-12))
-            arg = (3*qm)/(2*pm) * torch.sqrt(-3.0/pm)
-            arg = torch.clamp(arg, -1+1e-9, 1-1e-9)
-            theta = torch.acos(arg) / 3.0
-            y[~mask] = 2.0 * r * torch.cos(theta)
-
-        x = y - shift
-        return x
-
-    # === (4) 반복 없이 θ 해를 반환 ===
-    def solve_theta(self, use_tail_switch=0.6):
+    def A_of_theta_world(self, theta):
         """
-        반복 없이 θ를 반환. 
-        - 초기 구간( A_tgt <= use_tail_switch * A_max ): θ_E 주변 카르다노
-        - 말기 구간: θ_max 주변(보완량 ΔA) 카르다노
+        theta: [B] 또는 [B,K]
+        반환: A(theta), P(theta)
         """
-        # 기하 각들
+        device, dtype = theta.device, theta.dtype
+        B = theta.shape[0]
+
+        # --- 월드 파라미터를 [B]/[B,2]로 강제 ---
+        R = self.ensure_B(self.bucket_circle, B, device, dtype)        # [B]
+        O = self.ensure_B2(self.tip_pos,        B, device, dtype)      # [B,2]
+        E = self.ensure_B2(self.tip_pos2,       B, device, dtype)      # [B,2]
+        C = self.ensure_B2(self.circle_mid,     B, device, dtype)      # [B,2]
+     
+        B, K = theta.shape
+        cos_t, sin_t = torch.cos(theta), torch.sin(theta)                 # [B,K]
+        P  = C[:, None, :] + torch.stack([R[:, None]*cos_t,
+                                            R[:, None]*sin_t], dim=-1)      # [B,K,2]
+        EO = (E - O)[:, None, :]                                          # [B,1,2]
+        PO = P - O[:, None, :]                                            # [B,K,2]
+        cross_raw = self.cross2(EO, PO)                                       # [B,K]
+        Atr = 0.5 * cross_raw.abs()
+
+        EC = E - C
+        theta_E = torch.atan2(EC[..., 1], EC[..., 0])                     # [B]
+        dtheta = torch.clamp(theta_E[:, None] - theta, min=0.0)           # [B,K]
+        Aseg = 0.5 * (R[:, None]**2) * (dtheta - torch.sin(dtheta))       # [B,K]
+
+        return Atr + Aseg, P                                              # [B,K], [B,K,2]
+
+    def dA_dtheta_world(self, theta):
+        """theta: [B]"""
+        device, dtype = theta.device, theta.dtype
+        B = theta.shape[0]
+        R = self.ensure_B(self.bucket_circle, B, device, dtype)
+        O = self.ensure_B2(self.tip_pos,    B, device, dtype)
+        E = self.ensure_B2(self.tip_pos2,   B, device, dtype)
+        C = self.ensure_B2(self.circle_mid, B, device, dtype)
+
+        cos_t, sin_t = torch.cos(theta), torch.sin(theta)
+        P   = C + torch.stack([R * cos_t, R * sin_t], dim=-1)                 # [B,2]
+        P1  = torch.stack([-R * sin_t, R * cos_t], dim=-1)                    # [B,2]
+
+        EO = E - O
+        cross_raw = self.cross2(EO, P - O)                                        # [B]
+        sgn = torch.where(torch.sign(cross_raw) == 0,
+                          torch.ones_like(cross_raw), torch.sign(cross_raw))
+        tri_term = 0.5 * sgn * self.cross2(EO, P1)                                # [B]
+
+        EC = E - C
+        theta_E = torch.atan2(EC[..., 1], EC[..., 0])                         # [B]
+        dtheta = theta - theta_E
+        seg_term = 0.5 * (R**2) * (1.0 - torch.cos(torch.clamp(dtheta, min=0.0)))
+        seg_term = torch.where(dtheta >= 0.0, seg_term, torch.zeros_like(seg_term))
+        return tri_term + seg_term
+
+    @torch.no_grad()
+    def solve_theta(self, K: int = 512, eps: float = 1e-12):
+        """테이블 룩업 → 선형보간 → 뉴턴 1회 (월드)"""
+        # θ 그리드
         EC = self.tip_pos2 - self.circle_mid
-        theta_E = torch.atan2(EC[:,1], EC[:,0])
-        theta_max = theta_E + torch.pi  # 립 각도를 알고 있으면 그걸 쓰세요
+        theta_E   = torch.atan2(EC[..., 1], EC[..., 0])    # [B]
+        theta_max = theta_E - torch.pi
 
-        # 목표/경계 면적
-        A_tgt = self.fill_ratio.clone()
-        A_low, _ = self.A_of_theta(theta_E)
-        A_max, _ = self.A_of_theta(theta_max)
-        A_tgt = torch.minimum(torch.maximum(A_tgt, A_low), A_max)
+        w = torch.linspace(0.0, 1.0, K, device=theta_E.device, dtype=theta_E.dtype)
+        theta_grid = theta_E[:, None] + (theta_max - theta_E)[:, None] * w[None, :]  # [B,K]
+        A_grid = w.repeat(self.num_envs, 1)
+    
+        # 타깃 면적 클램프
+        A_tgt = self.fill_ratio
+        
+        # 구간 인덱스 + 보간
+        idx = torch.sum(A_grid < A_tgt[:, None], dim=1, keepdim=True).clamp(1, K-1)
+        i0, i1 = idx - 1, idx
+        A0, A1   = A_grid.gather(1, i0), A_grid.gather(1, i1)
+        th0, th1 = theta_grid.gather(1, i0), theta_grid.gather(1, i1)
+        t = (A_tgt[:, None] - A0) / (A1 - A0).clamp_min(eps)
+        theta = (th0 + t * (th1 - th0)).squeeze(1)        # [B]
 
-        # 스위치: 초기/말기 구간 선택
-        use_head = (A_tgt <= use_tail_switch * A_max)
+        # # # 뉴턴 1회
+        # f  = self.A_of_theta_world(theta0)[0] - A_tgt
+        # df = self.dA_dtheta_world(theta0).clamp_min(1e-9)
+        # theta = torch.clamp(theta0 - f/df, theta_E, theta_max)
+        theta = torch.where(theta < -torch.pi, 2*torch.pi + theta, theta)
 
-        # --- 초기 구간: θ = θ_E + x (카르다노) ---
-        alpha_h, beta_h, gamma_h, thetaE = self._cubic_coeffs_initial()
-        x_h = self._cardano(alpha_h, beta_h, gamma_h, A_tgt)
-        theta_head = thetaE + x_h
-
-        # --- 말기 구간: y = θ_max - θ,  ΔA = A_max - A(θ) ≈ γ'y + β'y^2 + α'y^3 ---
-        A1, A2, A3 = self._derivs_at(theta_max)   # A', A'', A'''
-        alpha_t =  (1.0/6.0) * A3                 # α'  (y^3 계수)
-        beta_t  = -(1.0/2.0) * A2                 # β'  (y^2 계수)
-        gamma_t =  A1                              # γ'  (y   계수)
-        dA = (A_max - A_tgt).clamp_min(0.0)
-        y_t = self._cardano(alpha_t.clamp_min(1e-12), beta_t, gamma_t, dA)
-        theta_tail = theta_max - y_t
-
-        # --- 구간 합치기 ---
-        theta = torch.where(use_head, theta_head, theta_tail)
-
-        # 최종 P/기록
-        P = self.circle_mid + torch.stack(
-            [self.bucket_circle*torch.cos(theta),
-             self.bucket_circle*torch.sin(theta)], dim=-1)
+        # 최종 P
+        R = self.ensure_B(self.bucket_circle, theta.shape[0], theta.device, theta.dtype)
+        C = self.ensure_B2(self.circle_mid, theta.shape[0], theta.device, theta.dtype)
+        P = C + torch.stack([R * torch.cos(theta), R * torch.sin(theta)], dim=-1)
+        
         self.P_cord = P
         self.max_L  = torch.norm(P, dim=-1)
-        return theta
+        return theta, P
 
 
     def skew(self, v: torch.Tensor) -> torch.Tensor:
