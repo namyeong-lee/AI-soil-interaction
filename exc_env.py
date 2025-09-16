@@ -337,6 +337,22 @@ class ExcEnv(DirectRLEnv):
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         cabin_lin_vel = self._robot.data.body_lin_vel_w[list(range(0, self.num_envs)), self.cabin_idx][:,[0,2]]
         buck_pos = (self._robot.data.body_pos_w[list(range(0, self.num_envs)), self.buck_idx] - self.scene.env_origins)[:,[0,2]]
+        self.tip_pos = (self._robot.data.body_pos_w[list(range(0, self.num_envs)), self.tip_idx] - self.scene.env_origins)[:,[0,2]]
+        self.tip_pos2 = (self._robot.data.body_pos_w[list(range(0, self.num_envs)), self.tip2_idx] - self.scene.env_origins)[:,[0,2]]
+        self.tip_lin_vel = self._robot.data.body_lin_vel_w[list(range(0, self.num_envs)), self.tip_idx][:,[0,2]]
+        self.ang_tip_plate = self.tip_ang+torch.atan2(self.tip_lin_vel[:,1], self.tip_lin_vel[:,0])
+        self.fill_ratio = self.compute_fill_ratio(self.tip_pos)
+        self.pre_tip_pos = self.tip_pos
+        self.cabin_pos = (self._robot.data.body_pos_w[list(range(0, self.num_envs)), self.cabin_idx] - self.scene.env_origins)[:,[0,2]]
+        joint_ang = self._robot.data.joint_pos
+        self.boom_ang = joint_ang[:,0]
+        self.arm_ang = joint_ang[:,1]
+        self.buck_ang = joint_ang[:,2]
+        self.circle_mid = (self._robot.data.body_pos_w[list(range(0, self.num_envs)), self.circle_mid_idx] - self.scene.env_origins)[:,[0,2]]
+        self.solve_theta()
+        plate_ang = self.tip_pos - self.tip_pos2
+        self.tip_ang2 = -self.batch_angle_xz(self.tip_pos3,self.tip_pos)
+        self.tip_ang_vel = self._robot.data.body_ang_vel_w[list(range(0, self.num_envs)), self.tip_idx][:,1]
         j = self.count_steps // self.cfg.n_steps
         self.kj = 1 - torch.exp(torch.tensor(-0.01 * j))
         self.count_steps += 1
@@ -348,6 +364,7 @@ class ExcEnv(DirectRLEnv):
         self.nc4 = (self.fill_ratio == 0.) & ((self.tip_pos[:,1] - self.soil_height) > 0.5)
         self.nc5 = ((self.tip_pos[:,0] > -2.5) & ((self.cabin_pos[:,1] + 2.) > self.tip_pos[:,1])) | (self.boom_ang <= self.joint_lower_limits[0]) | (self.boom_ang >= self.joint_upper_limits[0]) | (self.arm_ang <= self.joint_lower_limits[1]) | (self.arm_ang >= self.joint_upper_limits[1]) | (self.buck_ang <= self.joint_lower_limits[2]) | (self.buck_ang >= self.joint_upper_limits[2])
         self.nc6 = (self.fill_ratio == 1.) & ((self.P_cord[:,1] <  self.soil_height) | (self.tip_pos[:,1] < self.soil_height)) 
+        self.nc7 = (self.fill_ratio > 0.) & (self.tip_pos[:,1] > self.soil_height) & (torch.atan2(plate_ang[:,1], plate_ang[:,0]) < 0.)
         
         pc1 = self.fill_ratio > self.kj * 0.68 + 0.3
         pc2 = torch.norm(self.cabin_pos - self.tip_pos, dim=-1) < 3.0
@@ -356,7 +373,7 @@ class ExcEnv(DirectRLEnv):
         pc5 = buck_pos[:,1] > self.tip_pos[:,1]
         
         positive_terminations = torch.where((pc1 | pc2) & pc3 & pc4 & pc5, 1., 0.)
-        negative_terminations = torch.where(self.nc1 | self.nc2 | self.nc3 | self.nc4 | self.nc5 | self.nc6, 1., 0.)
+        negative_terminations = torch.where(self.nc1 | self.nc2 | self.nc3 | self.nc4 | self.nc5 | self.nc6 | self.nc7, 1., 0.)
         
         self.fill_terminal_reward = torch.where(pc1 & pc3 & pc4 & pc5, 10., 0.)
         self.close_terminal_reward = torch.where(pc2 & pc3 & pc4 & pc5, 5., 0.)
@@ -371,9 +388,12 @@ class ExcEnv(DirectRLEnv):
         
         # return torch.tensor([a]*self.num_envs), torch.tensor([a]*self.num_envs)
         
+        print(positive_terminations[0], negative_terminations[0])
+        
         return positive_terminations, negative_terminations
 
     def _get_rewards(self) -> torch.Tensor:
+        print("reward", (self._robot.data.body_pos_w[list(range(0, self.num_envs)), self.tip2_idx] - self.scene.env_origins)[:,[0,2]][0])
         
         c1 = self.fill_ratio > (self.kj * 0.6 + 0.3)
         c2 = torch.norm(self.cabin_pos - self.tip_pos, dim=-1) < 3.0
@@ -394,7 +414,7 @@ class ExcEnv(DirectRLEnv):
         self.pre_actions = self.actions
         
         reward = move_down + filling + move_up + curl + smooth
-        reward = torch.where(self.nc1 | self.nc2 | self.nc3 | self.nc4 | self.nc5 | self.nc6, reward-1., reward)
+        reward = torch.where(self.nc1 | self.nc2 | self.nc3 | self.nc4 | self.nc5 | self.nc6 | self.nc7, reward-1., reward)
         
         total_reward = reward + self.fill_terminal_reward + self.close_terminal_reward
         
@@ -403,6 +423,7 @@ class ExcEnv(DirectRLEnv):
 
     def _reset_idx(self, env_ids: torch.Tensor | None):
         super()._reset_idx(env_ids)
+        #print(id, env_ids)
         
         # cab_ang = sample_uniform(0., 0., len(env_ids), self.device)
         # ang = quat_from_angle_axis(cab_ang, torch.tensor([0.0, 1.0, 0.0], device=self.device))
@@ -427,7 +448,13 @@ class ExcEnv(DirectRLEnv):
         self._robot.write_root_pose_to_sim(torch.cat((self.fixed_pos[env_ids], ang), dim=-1), env_ids=env_ids)
         self.object.write_root_pose_to_sim(torch.cat((self.obj_pos[env_ids], ang), dim=-1), env_ids=env_ids)
         
-        copy_env_ids = env_ids.clone()
+        #copy_env_ids = env_ids.clone()
+        random = sample_uniform(0, 1, (len(env_ids)), self.device)
+        random_id = torch.where(random<0.25)[0]
+        random_id1 = torch.where(random<0.25)[0]
+        copy_env_ids = env_ids[~torch.isin(env_ids, random_id)]
+        copy_env_ids1 = env_ids[random_id]
+        
         while True:
             boom_ang = sample_uniform(self.joint_lower_limits[0]+0.1, self.joint_upper_limits[0]-0.1, (len(copy_env_ids), 1), self.device)
             arm_ang = sample_uniform(self.joint_lower_limits[1]+0.1, self.joint_upper_limits[1]-0.1, (len(copy_env_ids), 1), self.device)
@@ -443,30 +470,23 @@ class ExcEnv(DirectRLEnv):
             condition = (self.tip_pos[:, 1] - self.soil_height[copy_env_ids]) >= 0.4
             copy_env_ids = copy_env_ids[condition]
             
-            if copy_env_ids.numel() ==0:
-                break
-            
-        random = sample_uniform(0, 1, (len(env_ids)), self.device)
-        random_id = torch.where(random<0.25)[0]
-        random_id1 = torch.where(random<0.25)[0]
-        
-        while True:
-            boom_ang = sample_uniform(self.joint_lower_limits[0]+0.1, self.joint_upper_limits[0]-0.1, (len(random_id), 1), self.device)
-            arm_ang = sample_uniform(self.joint_lower_limits[1]+0.1, self.joint_upper_limits[1]-0.1, (len(random_id), 1), self.device)
-            buck_ang = sample_uniform(self.joint_lower_limits[2]+0.1, self.joint_upper_limits[2]-0.1, (len(random_id), 1), self.device)
+            boom_ang = sample_uniform(self.joint_lower_limits[0]+0.1, self.joint_upper_limits[0]-0.1, (len(copy_env_ids1), 1), self.device)
+            arm_ang = sample_uniform(self.joint_lower_limits[1]+0.1, self.joint_upper_limits[1]-0.1, (len(copy_env_ids1), 1), self.device)
+            buck_ang = sample_uniform(self.joint_lower_limits[2]+0.1, self.joint_upper_limits[2]-0.1, (len(copy_env_ids1), 1), self.device)
             joint_pos = torch.cat((boom_ang, arm_ang, buck_ang),-1)
             joint_vel = torch.zeros_like(joint_pos)
-            self._robot.set_joint_position_target(joint_pos, env_ids=random_id)
-            self._robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=random_id)
+            self._robot.set_joint_position_target(joint_pos, env_ids=copy_env_ids1)
+            self._robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=copy_env_ids1)
             self.scene.update(dt=self.physics_dt)
             
-            self.tip_pos = (self._robot.data.body_pos_w[random_id, self.tip_idx] - self.scene.env_origins[random_id])[:,[0,2]]
+            self.tip_pos = (self._robot.data.body_pos_w[copy_env_ids1, self.tip_idx] - self.scene.env_origins[copy_env_ids1])[:,[0,2]]
 
-            condition = (self.tip_pos[:, 1] - self.soil_height[random_id]) >= 0.
-            random_id = random_id[condition]
-
-            if random_id.numel() ==0:
+            condition = (self.tip_pos[:, 1] - self.soil_height[copy_env_ids1]) >= 0.
+            copy_env_ids1 = copy_env_ids1[condition]
+            
+            if (copy_env_ids.numel() == 0) & (copy_env_ids1.numel() == 0):
                 break
+            
         
         self.soil_height[env_ids] = sample_uniform(-2.0, -0.5, (len(env_ids)), self.device)
         self.prev_error[env_ids] = torch.zeros((len(env_ids), 3), device=self.device)
@@ -492,8 +512,6 @@ class ExcEnv(DirectRLEnv):
 
         self.P_cord[env_ids] = (self._robot.data.body_pos_w[env_ids, self.tip2_idx] - self.scene.env_origins[env_ids])[:,[0,2]]
         
-
-    def _get_observations(self) -> dict:
         joint_ang = self._robot.data.joint_pos
         self.boom_ang = joint_ang[:,0]
         self.arm_ang = joint_ang[:,1]
@@ -508,33 +526,29 @@ class ExcEnv(DirectRLEnv):
         self.tip_ang2 = -self.batch_angle_xz(self.tip_pos3,self.tip_pos)
         self.tip_lin_vel = self._robot.data.body_lin_vel_w[list(range(0, self.num_envs)), self.tip_idx][:,[0,2]]
         self.tip_ang_vel = self._robot.data.body_ang_vel_w[list(range(0, self.num_envs)), self.tip_idx][:,1]
-  
-        cabin_ang = self._robot.data.body_quat_w[list(range(0, self.num_envs)), self.cabin_idx]
-        cabin_ang = axis_angle_from_quat(cabin_ang)[:,1]
         self.cabin_pos = (self._robot.data.body_pos_w[list(range(0, self.num_envs)), self.cabin_idx] - self.scene.env_origins)[:,[0,2]]
-        
-        
-        cab_denom = -self.arm_direction_angle(self.cabin_pos, self.tip_pos)
-        cab_denom = torch.where(cab_denom.abs() < 1e-9, 1e-9 * torch.sign(cab_denom), cab_denom)
-        cabin_ang_rate = cabin_ang / cab_denom
-        
         self.ang_tip_plate = self.tip_ang+torch.atan2(self.tip_lin_vel[:,1], self.tip_lin_vel[:,0])
         
-        self.fill_ratio = self.compute_fill_ratio(self.tip_pos)
-        self.pre_tip_pos = self.tip_pos
+
+    def _get_observations(self) -> dict:
+        cabin_ang = self._robot.data.body_quat_w[list(range(0, self.num_envs)), self.cabin_idx]
+        cabin_ang = axis_angle_from_quat(cabin_ang)[:,1]
         
+        cab_denom = -self.arm_direction_angle(self.cabin_pos, self.tip_pos)
+        cab_denom = torch.where(cab_denom.abs() < 1e-9, 1e-9 * (torch.sign(cab_denom) + (cab_denom == 0.).float()), cab_denom)
+        cabin_ang_rate = cabin_ang / cab_denom
         
         self.soil_force()
         
-        
-        print(self.fill_ratio[0])
-        print(self.P_cord[0], self.tip_pos2[0], self.tip_pos[0], self.soil_height[0])
+        #print(self.P_cord[0], self.tip_pos[0], self.soil_height[0])
         print("------------------------------------------------")
         
         obs = torch.cat(
             (   
                 self._robot.data.computed_torque/3e5,
-                joint_ang,
+                self.boom_ang.unsqueeze(-1),
+                self.arm_ang.unsqueeze(-1),
+                self.buck_ang.unsqueeze(-1),
                 self._robot.data.joint_vel,
                 self.actions,
                 self.soil_height.unsqueeze(-1),
@@ -678,13 +692,16 @@ class ExcEnv(DirectRLEnv):
         
         PO = bkt - self.P_cord
         beta = -torch.atan2(PO[:,1], PO[:,0]) # angle between ground and bucket
-        #beta = -torch.atan2(b[:,1],b[:,0]) 
-        beta = torch.where(torch.isnan(intersec_x), torch.zeros_like(beta), beta)
+        beta = torch.where(beta <= 0., torch.zeros_like(beta), beta)
+        
+        #sep_plate_sur = torch.where(((torch.norm(sep_plate_sur - bkt, dim=-1) <= self.max_L) | (beta > 0.)).unsqueeze(-1), sep_plate_sur, self.P_cord)
+        sep_plate_sur = torch.where((beta < 0.).unsqueeze(-1), self.P_cord, sep_plate_sur)
+        sep_plate_sur = torch.where((self.P_cord[:,1] < sep_plate_sur[:,1]).unsqueeze(-1), self.P_cord, sep_plate_sur)
         
         lo = (torch.pi/4 - (self.sifa + self.sbfa)/2) + (torch.pi/4 - beta/2)
         
         abc_denom = torch.tan(lo)
-        abc_denom = torch.where(abc_denom.abs() < 1e-9, 1e-9 * torch.sign(abc_denom), abc_denom)
+        abc_denom = torch.where(abc_denom.abs() < 1e-9, 1e-9 * (torch.sign(abc_denom) + (abc_denom == 0.).float()), abc_denom)
         area_abc = 0.5 * L * torch.sin(beta) * (L * torch.cos(beta) + L * torch.sin(beta) / abc_denom)
         area_abx = 0.5 * torch.abs(bkt[:,0]*sep_plate_sur[:,1]+sep_plate_sur[:,0]*up_plate_sur[:,1]+up_plate_sur[:,0]*bkt[:,1] 
                                    - (bkt[:,0]*up_plate_sur[:,1]+up_plate_sur[:,0]*sep_plate_sur[:,1]+sep_plate_sur[:,0]*bkt[:,1]))
@@ -700,31 +717,33 @@ class ExcEnv(DirectRLEnv):
         sifa_s = (self.sbfa * area_abx + self.sifa * area_bcx) / area_abc.clamp_min(1e-9)
         
         z_denom1 = torch.tan(lo)
-        z_denom1 = torch.where(z_denom1.abs() < 1e-9, 1e-9 * torch.sign(z_denom1), z_denom1)
+        z_denom1 = torch.where(z_denom1.abs() < 1e-9, 1e-9 * (torch.sign(z_denom1) + (z_denom1 == 0.).float()), z_denom1)
         
         z_denom2 = (torch.sin(beta)*(torch.cos(beta)+torch.sin(beta)/z_denom1))
-        z_denom2 = torch.where(z_denom2.abs() < 1e-9, 1e-9 * torch.sign(z_denom2), z_denom2)
+        z_denom2 = torch.where(z_denom2.abs() < 1e-9, 1e-9 * (torch.sign(z_denom2) + (z_denom2 == 0.).float()), z_denom2)
         
         z = -L/3*((torch.cos(beta)+torch.sin(beta)/torch.tan(lo))*(-torch.square(torch.sin(beta)))) / z_denom2
         ADF = self.c_a * self.B * L
         
         W_denom = torch.tan(lo)
-        W_denom = torch.where(W_denom.abs() < 1e-9, 1e-9 * torch.sign(W_denom), W_denom)
+        W_denom = torch.where(W_denom.abs() < 1e-9, 1e-9 * (torch.sign(W_denom) + (W_denom == 0.).float()), W_denom)
         W = self.uw * self.B * (0.5 * L * torch.sin(beta) * (L * torch.cos(beta) + L * torch.sin(beta) / W_denom))
         
         CF_denom = torch.sin(lo)
-        CF_denom = torch.where(CF_denom.abs() < 1e-9, 1e-9 * torch.sign(CF_denom), CF_denom)
+        CF_denom = torch.where(CF_denom.abs() < 1e-9, 1e-9 * (torch.sign(CF_denom) + (CF_denom == 0.).float()), CF_denom)
         CF = self.c * self.B * L * torch.sin(beta) / CF_denom
         
         ACF_denom = torch.tan(lo)
-        ACF_denom = torch.where(ACF_denom.abs() < 1e-9, 1e-9 * torch.sign(ACF_denom), ACF_denom)
+        ACF_denom = torch.where(ACF_denom.abs() < 1e-9, 1e-9 * (torch.sign(ACF_denom) + (ACF_denom == 0.).float()), ACF_denom)
         ACF = 0.5 * c_s * (L**2) * torch.sin(beta) * (torch.cos(beta) + torch.sin(beta)/ACF_denom)
         
         SF_denom = torch.tan(lo)
-        SF_denom = torch.where(SF_denom.abs() < 1e-9, 1e-9 * torch.sign(SF_denom), SF_denom)
+        SF_denom = torch.where(SF_denom.abs() < 1e-9, 1e-9 * (torch.sign(SF_denom) + (SF_denom == 0.).float()), SF_denom)
         SF = 0.5 * K * self.uw * z * torch.tan(sifa_s) * torch.square(L) * torch.sin(beta) * (torch.cos(beta)+ torch.sin(beta) / SF_denom)
 
         R_s = (-ADF * torch.cos(beta+lo+self.sifa) + W * torch.sin(lo+self.sifa) + CF * torch.cos(self.sifa) + 2 * ACF * torch.cos(self.sifa) + 2 * SF * torch.cos(self.sifa)) / torch.sin(beta+lo+self.sbfa+self.sifa).clamp_min(1e-9)
+        
+        #print(-ADF[0], torch.cos(beta+lo+self.sifa)[0], W[0], torch.sin(lo+self.sifa)[0], CF[0], torch.cos(self.sifa)[0], 2 * ACF[0], torch.cos(self.sifa)[0], 2 * SF[0], torch.cos(self.sifa)[0])
         
         #center_z = torch.norm(PO, dim=-1) / 2
         center_z = L / 2
@@ -733,22 +752,22 @@ class ExcEnv(DirectRLEnv):
         p = self.cpf * p_n
         R_ps = (self.c_a + p_n * torch.tan(self.sbfa)) * self.B * L
         R_pt_denom = torch.tan(torch.tensor(self.alpha, device=self.device))
-        R_pt_denom = torch.where(R_pt_denom.abs() < 1e-9, 1e-9 * torch.sign(R_pt_denom), R_pt_denom)
-        R_pt = self.n * (p + (self.c_a + p * torch.tan(self.sifa)) * (1 / R_pt_denom)) * self.A_t
+        R_pt_denom = torch.where(R_pt_denom.abs() < 1e-9, 1e-9 * (torch.sign(R_pt_denom) + (R_pt_denom == 0.).float()), R_pt_denom)
+        R_pt = self.n * (p + (self.c_a + p * torch.tan(self.sbfa)) * (1 / R_pt_denom)) * self.A_t
         
         R_p = R_ps + R_pt
-        R_p = R_p * torch.cos(self.ang_tip_plate)
-        R_s = torch.where(bkt[:,1] > self.soil_height, torch.zeros_like(R_s), R_s)
+        R_p = R_p * torch.cos(self.ang_tip_plate).clamp_min(0.)
+        R_s = torch.where((bkt[:,1] > self.soil_height) | (beta <= 0.), torch.zeros_like(R_s), R_s)
         R_p = torch.where(bkt[:,1] > self.soil_height, torch.zeros_like(R_p), R_p)
         
         # O,P,E: [...,2] (월드 or 로컬)
         d = PO / (PO.norm(dim=-1, keepdim=True).clamp_min(1e-9)) # plate dir
-        n1 = torch.stack([-d[...,1], d[...,0]], dim=-1)         # rotate +90°
-        n2 = -n1
-        M  = 0.5*(bkt + self.P_cord)
-        Q_in = (bkt + self.tip_pos2 + self.P_cord)/3.0         # interior ref
-        use_n1 = ( (Q_in - M)*n1 ).sum(dim=-1) > 0.
-        n = torch.where(use_n1.unsqueeze(-1), n1, n2)
+        n = -torch.stack([-d[...,1], d[...,0]], dim=-1)         # rotate +90°
+        # n2 = -n1
+        # M  = 0.5*(bkt + self.P_cord)
+        # Q_in = (bkt + self.tip_pos2 + self.P_cord)/3.0         # interior ref
+        # use_n1 = ( (Q_in - M)*n1 ).sum(dim=-1) > 0.
+        # n = -torch.where(use_n1.unsqueeze(-1), n1, n2)
 
         EO = self.tip_pos2 -bkt
         d1 = EO / (EO.norm(dim=-1, keepdim=True).clamp_min(1e-9))
@@ -757,13 +776,12 @@ class ExcEnv(DirectRLEnv):
         Fp = d1 * R_p.unsqueeze(-1)
         
         Fs_pos = (sep_plate_sur + bkt) / 2
-        Fs_pos = torch.where(((torch.norm(sep_plate_sur - bkt, dim=-1) > L) |  torch.isnan(intersec_x)).unsqueeze(-1), (self.P_cord + bkt) / 2, Fs_pos)
+        #Fs_pos = torch.where(((torch.norm(sep_plate_sur - bkt, dim=-1) > L) |  torch.isnan(intersec_x)).unsqueeze(-1), (self.P_cord + bkt) / 2, Fs_pos)
         
-        c, s = torch.cos(self.sbfa), torch.sin(self.sbfa)
+        c, s = torch.cos(-self.sbfa), torch.sin(-self.sbfa)
         R = torch.stack((torch.stack((c, -s), -1),
                         torch.stack((s,  c), -1)), -2)          # (..., 2, 2)
         rotated_Fs = (R @ Fs.unsqueeze(-1)).squeeze(-1)     
-        
         
         Fs_pos_y = torch.ones((self.num_envs, 1), dtype=torch.float32, device=self.device) * 0.035
         Fs_pos = torch.cat((Fs_pos[:,0].unsqueeze(-1), Fs_pos_y, Fs_pos[:,1].unsqueeze(-1)), dim=-1)[:,None,:]
@@ -777,8 +795,6 @@ class ExcEnv(DirectRLEnv):
         Fp_y = torch.zeros((self.num_envs, 1), dtype=torch.float32, device=self.device)
         Fp = torch.cat((Fp[:,0].unsqueeze(-1), Fp_y, Fp[:,1].unsqueeze(-1)), dim=-1)[:,None,:]
         
-        print(Fs_pos[0], (self.P_cord + bkt)[0] / 2)
-        
         total_f = torch.cat((rotated_Fs, Fp), dim=1)
         total_pos = torch.cat((Fs_pos, Fp_pos), dim=1)
         
@@ -786,6 +802,10 @@ class ExcEnv(DirectRLEnv):
         Fw = self.get_wrench(total_f, total_pos)
         
         tau_gen = torch.einsum('bij,bj->bi', Jw.transpose(1,2), Fw)  # (B,6+n)
+        
+        #print(Fw[0][:3])
+        #print(tau_gen[:, 6:][0])
+        #print(tau_gen[:, 6:])
 
         self.tau_base   = tau_gen[:, :6]   # (B,6)
         self.tau_joints = tau_gen[:, 6:]   # (B,n)
