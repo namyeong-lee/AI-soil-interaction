@@ -538,8 +538,6 @@ class ExcEnv(DirectRLEnv):
         cab_denom = torch.where(cab_denom.abs() < 1e-9, 1e-9 * (torch.sign(cab_denom) + (cab_denom == 0.).float()), cab_denom)
         cabin_ang_rate = cabin_ang / cab_denom
         
-        print("------------------------------------------------")
-        
         obs = torch.cat(
             (   
                 self._robot.data.computed_torque/3e5,
@@ -789,9 +787,7 @@ class ExcEnv(DirectRLEnv):
         
         Fg_pos_y = torch.ones((self.num_envs, 1), dtype=torch.float32, device=self.device) * 0.035
         Fg_pos = torch.cat((self.centroid[:,0].unsqueeze(-1), Fg_pos_y, self.centroid[:,1].unsqueeze(-1)), dim=-1)[:,None,:]
-    
-        Fg_y = torch.zeros((self.num_envs, 1), dtype=torch.float32, device=self.device)
-        Fg = torch.cat((Fg[:,0].unsqueeze(-1), Fg_y, Fg[:,1].unsqueeze(-1)), dim=-1)[:,None,:]
+        Fg = Fg[:,None,:]
         
         total_f = torch.cat((rotated_Fs, Fp, Fg), dim=1)
         total_pos = torch.cat((Fs_pos, Fp_pos, Fg_pos), dim=1)
