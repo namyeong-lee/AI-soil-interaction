@@ -280,6 +280,7 @@ class ExcEnv(DirectRLEnv):
         self.max_L = torch.full_like(self.c, self.plate_height, dtype=torch.float32)
         self.soil_mass = torch.full_like(self.c, 0., dtype=torch.float32)
         self.P_cord = torch.zeros((self.num_envs, 2), device=self.device)
+        self.centroid = torch.zeros((self.num_envs, 2), device=self.device)
         
         self.tau_base   = 0.   # (B,6)
         self.tau_joints = 0.   # (B,n)
@@ -509,6 +510,7 @@ class ExcEnv(DirectRLEnv):
         self.soil_mass[env_ids] = torch.full_like(self.c[env_ids], 0., dtype=torch.float32)
 
         self.P_cord[env_ids] = (self._robot.data.body_pos_w[env_ids, self.tip2_idx] - self.scene.env_origins[env_ids])[:,[0,2]]
+        self.centroid[env_ids] =  torch.zeros((len(env_ids), 2), device=self.device)
         
         joint_ang = self._robot.data.joint_pos
         self.boom_ang = joint_ang[:,0]
@@ -765,8 +767,6 @@ class ExcEnv(DirectRLEnv):
         Fp = d1 * R_p.unsqueeze(-1)
         Fg = g_world * self.soil_mass[...,None] 
         
-        
-        
         Fs_pos = (sep_plate_sur + bkt) / 2
         #Fs_pos = torch.where(((torch.norm(sep_plate_sur - bkt, dim=-1) > L) |  torch.isnan(intersec_x)).unsqueeze(-1), (self.P_cord + bkt) / 2, Fs_pos)
         
@@ -787,8 +787,14 @@ class ExcEnv(DirectRLEnv):
         Fp_y = torch.zeros((self.num_envs, 1), dtype=torch.float32, device=self.device)
         Fp = torch.cat((Fp[:,0].unsqueeze(-1), Fp_y, Fp[:,1].unsqueeze(-1)), dim=-1)[:,None,:]
         
-        total_f = torch.cat((rotated_Fs, Fp), dim=1)
-        total_pos = torch.cat((Fs_pos, Fp_pos), dim=1)
+        Fg_pos_y = torch.ones((self.num_envs, 1), dtype=torch.float32, device=self.device) * 0.035
+        Fg_pos = torch.cat((self.centroid[:,0].unsqueeze(-1), Fg_pos_y, self.centroid[:,1].unsqueeze(-1)), dim=-1)[:,None,:]
+    
+        Fg_y = torch.zeros((self.num_envs, 1), dtype=torch.float32, device=self.device)
+        Fg = torch.cat((Fg[:,0].unsqueeze(-1), Fg_y, Fg[:,1].unsqueeze(-1)), dim=-1)[:,None,:]
+        
+        total_f = torch.cat((rotated_Fs, Fp, Fg), dim=1)
+        total_pos = torch.cat((Fs_pos, Fp_pos, Fg_pos), dim=1)
         
         Jw = self.get_jacobian()
         Fw = self.get_wrench(total_f, total_pos)
@@ -910,7 +916,7 @@ class ExcEnv(DirectRLEnv):
 
             dtheta = torch.clamp(theta_E - theta, min=0.0)              # [B]
             Aseg = 0.5 * (R**2) * (dtheta - torch.sin(dtheta))          # [B]
-            return Atr + Aseg
+            return Atr, Aseg
 
         else:  # [B,K]
             B, K = theta.shape
@@ -925,7 +931,7 @@ class ExcEnv(DirectRLEnv):
 
             dtheta = torch.clamp(theta_E[:, None] - theta, min=0.0)       # [B,K]
             Aseg = 0.5 * (R[:, None]**2) * (dtheta - torch.sin(dtheta))   # [B,K]
-            return Atr + Aseg                                             # [B,K], [B,K,2]
+            return Atr, Aseg                                             # [B,K], [B,K,2]
 
     def dA_dtheta_world(self, theta):
         """theta: [B]"""
@@ -963,7 +969,8 @@ class ExcEnv(DirectRLEnv):
 
         w = torch.linspace(0.0, 1.0, K, device=theta_E.device, dtype=theta_E.dtype)
         theta_grid = theta_E[:, None] + (theta_max - theta_E)[:, None] * w[None, :]  # [B,K]
-        A_grid = self.A_of_theta_world(theta_grid, theta_E)
+        Atr_grid, Aseg_grid = self.A_of_theta_world(theta_grid, theta_E)
+        A_grid = Atr_grid + Aseg_grid
 
         # 타깃 면적 클램프
         #A_tgt = self.fill_ratio
@@ -981,18 +988,31 @@ class ExcEnv(DirectRLEnv):
         # f  = self.A_of_theta_world(theta0, theta_E)[0] - A_tgt
         # df = self.dA_dtheta_world(theta0)
         # theta = torch.clamp(theta0 - f/df, theta_E, theta_max)
-        self.soil_mass = (self.A_of_theta_world(theta, theta_E) * self.plate_width * self.uw).clamp_min(0.0) 
-        theta = torch.where(theta < -torch.pi, 2*torch.pi + theta, theta)
+        A_tri, A_seg = self.A_of_theta_world(theta, theta_E)
+        A_tot = A_tri + A_seg
+        self.soil_mass = (A_tot * self.plate_width * self.uw).clamp_min(0.0) 
+        self.soil_mass = torch.where(self.fill_ratio==0., 0., self.soil_mass)
+        
+        P_theta = torch.where(theta < -torch.pi, 2*torch.pi + theta, theta)
 
         # 최종 P
-        R = self.ensure_B(self.bucket_circle, theta.shape[0], theta.device, theta.dtype)
-        C = self.ensure_B2(self.circle_mid, theta.shape[0], theta.device, theta.dtype)
-        P = C + torch.stack([R * torch.cos(theta), R * torch.sin(theta)], dim=-1)
+        R = self.ensure_B(self.bucket_circle, P_theta.shape[0], P_theta.device, P_theta.dtype)
+        C = self.ensure_B2(self.circle_mid, P_theta.shape[0], P_theta.device, P_theta.dtype)
+        P = C + torch.stack([R * torch.cos(P_theta), R * torch.sin(P_theta)], dim=-1)
         
         self.P_cord = P
         self.max_L  = torch.norm(P, dim=-1)
         
-        return theta, P
+        c_tri_2d = (self.tip_pos + self.tip_pos2 + P) / 3.0 
+        dth = theta_E -theta
+        theta_m = theta_E - 0.5*dth
+        s = torch.sin(0.5*dth)
+        denom = (dth - torch.sin(dth)).clamp_min(1e-9)
+        r_seg = (4.0*self.bucket_circle*s*s*s) / (3.0*denom)                            # [B]
+        c_seg_2d = torch.stack([r_seg*torch.cos(theta_m), r_seg*torch.sin(theta_m)], dim=-1) + C    # [B,2]
+        self.centroid = (A_tri.unsqueeze(-1)*c_tri_2d + A_seg.unsqueeze(-1)*c_seg_2d) / A_tot.unsqueeze(-1)
+        
+        return
 
 
     def skew(self, v: torch.Tensor) -> torch.Tensor:
