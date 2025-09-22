@@ -244,6 +244,7 @@ class ExcEnv(DirectRLEnv):
         self.total_swept = torch.zeros(self.num_envs, device=self.device)
         self.fill_ratio = torch.zeros(self.num_envs, device=self.device)
         self.epi_step = torch.zeros(self.num_envs, device=self.device)
+        self.reward_sum = torch.zeros(self.num_envs, device=self.device)
         self.max_step = self.cfg.episode_length_s / self.dt
         self.pre_fill_ratio = torch.zeros(self.num_envs, device=self.device)
         self.pre_actions = torch.zeros((self.num_envs, 3), device=self.device)
@@ -271,6 +272,10 @@ class ExcEnv(DirectRLEnv):
         self.uw = sample_uniform(17000, 22000, (self.num_envs), self.device)
         self.sbfa = sample_uniform(0.2, 0.4, (self.num_envs), self.device)
         self.cpf = sample_uniform(0, 300, (self.num_envs), self.device)
+        
+        self.boom_limit = torch.tensor([-3e6, 3e6], device=self.device)
+        self.arm_limit = torch.tensor([-3e5, 3e5], device=self.device)
+        self.buck_limit = torch.tensor([-2e5, 2e5], device=self.device)
         
         self.A_s = self.plate_width * self.plate_height # area of separation plate
         self.n = 5 # number of teeth
@@ -344,6 +349,8 @@ class ExcEnv(DirectRLEnv):
         
         self.tip_pos = (self._robot.data.body_pos_w[list(range(0, self.num_envs)), self.tip_idx] - self.scene.env_origins)[:,[0,2]]
         self.tip_pos2 = (self._robot.data.body_pos_w[list(range(0, self.num_envs)), self.tip2_idx] - self.scene.env_origins)[:,[0,2]]
+        self.tip_pos3 = (self._robot.data.body_pos_w[list(range(0, self.num_envs)), self.tip3_idx] - self.scene.env_origins)[:,[0,2]]
+        self.circle_mid = (self._robot.data.body_pos_w[list(range(0, self.num_envs)), self.circle_mid_idx] - self.scene.env_origins)[:,[0,2]]
         self.tip_lin_vel = self._robot.data.body_lin_vel_w[list(range(0, self.num_envs)), self.tip_idx][:,[0,2]]
         self.ang_tip_plate = self.tip_ang+torch.atan2(self.tip_lin_vel[:,1], self.tip_lin_vel[:,0])
         self.compute_fill_ratio(self.tip_pos)
@@ -359,10 +366,16 @@ class ExcEnv(DirectRLEnv):
         zero_actions[vel_zero] = 0.
         zero_torque = self.compute_torque(zero_actions, 1)
         self.torque[vel_zero] = zero_torque[vel_zero]
+
+        # Clamp to torque limits
+        self.torque[:,0] = torch.clamp(self.torque[:,0], min = self.boom_limit[0], max = self.boom_limit[1])
+        self.torque[:,1] = torch.clamp(self.torque[:,1], min = self.arm_limit[0], max = self.arm_limit[1])
+        self.torque[:,2] = torch.clamp(self.torque[:,2], min = self.buck_limit[0], max = self.buck_limit[1])
         
         #self.writer.add_scalar("tau_base", torch.max(self.tau_base), self.count_steps)
         # tau_base = f_base + g_base
         # self._robot.set_external_force_and_torque(tau_base[:,:3][:,None,:], tau_base[:,3:][:,None,:], body_ids=self.base_idx)
+        #print(self.torque[self.torque.isnan().any(dim=-1)])
         
         self._robot.set_joint_effort_target(self.torque)
     
@@ -446,7 +459,12 @@ class ExcEnv(DirectRLEnv):
         
         total_reward = reward + self.fill_terminal_reward + self.close_terminal_reward
         
-        self.writer.add_scalar("reward_mean", torch.mean(total_reward), self.count_steps)
+        self.reward_sum = self.reward_sum + reward
+        
+        if self.count_steps % self.cfg.n_steps == 0.:
+            self.writer.add_scalar("reward_mean", torch.mean(self.reward_sum), self.count_steps//self.cfg.n_steps)
+            self.reward_sum = torch.zeros(self.num_envs, device=self.device)
+            
         return total_reward
 
     def _reset_idx(self, env_ids: torch.Tensor | None):
@@ -570,9 +588,9 @@ class ExcEnv(DirectRLEnv):
         cabin_ang_rate = cabin_ang / cab_denom
         
         computed_torque = self._robot.data.computed_torque
-        computed_torque[:,0] = computed_torque[:,0] / 3e6
-        computed_torque[:,1] = computed_torque[:,1] / 3e5
-        computed_torque[:,2] = computed_torque[:,2] / 3e5
+        computed_torque[:,0] = computed_torque[:,0] / self.boom_limit[1]
+        computed_torque[:,1] = computed_torque[:,1] / self.arm_limit[1]
+        computed_torque[:,2] = computed_torque[:,2] / self.buck_limit[1]
         
         obs = torch.cat(
             (   
@@ -595,7 +613,7 @@ class ExcEnv(DirectRLEnv):
             dim=-1,
         )
         #obs = torch.where(torch.isnan(obs), 0., obs)
-        
+        #print("obs", obs[obs.isnan().any(dim=-1)])
         return {"policy": obs}
         #return {"policy": torch.clamp(obs, -5.0, 5.0)}
     
@@ -623,9 +641,7 @@ class ExcEnv(DirectRLEnv):
         Ki = torch.tensor([6.0e7, 1.0e5, 2.8e6], device=self.device)
         Kd = torch.tensor([0., 3200., 700.], device=self.device)
         
-        boom_limit = torch.tensor([-3e6, 3e6], device=self.device)
-        arm_limit = torch.tensor([-3e5, 3e5], device=self.device)
-        buck_limit = torch.tensor([-3e5, 3e5], device=self.device)
+
         reverse_torque_scale = 0.5
         
         #print(self._robot.data.joint_vel[0][2])
@@ -650,11 +666,6 @@ class ExcEnv(DirectRLEnv):
         # Apply direction-dependent reverse torque scaling
         wrong_direction = ((desired_vel > 0) & (torque < 0)) | ((desired_vel < 0) & (torque > 0))
         torque = torch.where(wrong_direction, torque * reverse_torque_scale, torque)
-
-        # Clamp to torque limits
-        torque[:,0] = torch.clamp(torque[:,0], min = boom_limit[0], max = boom_limit[1])
-        torque[:,1] = torch.clamp(torque[:,1], min = arm_limit[0], max = arm_limit[1])
-        torque[:,2] = torch.clamp(torque[:,2], min = buck_limit[0], max = buck_limit[1])
         
         return torque
     
@@ -782,7 +793,7 @@ class ExcEnv(DirectRLEnv):
         SF = 0.5 * K * self.uw * z * torch.tan(sifa_s) * torch.square(L) * torch.sin(beta) * (torch.cos(beta)+ torch.sin(beta) / SF_denom)
 
         R_s = (-ADF * torch.cos(beta+lo+self.sifa) + W * torch.sin(lo+self.sifa) + CF * torch.cos(self.sifa) + 2 * ACF * torch.cos(self.sifa) + 2 * SF * torch.cos(self.sifa)) / torch.sin(beta+lo+self.sbfa+self.sifa).clamp_min(1e-9)
-      
+     
         #center_z = torch.norm(PO, dim=-1) / 2
         center_z = L / 2
         p_n = 0.5 * self.uw * center_z*((1+K) + (1-K)*torch.cos(2*beta))
@@ -854,6 +865,9 @@ class ExcEnv(DirectRLEnv):
         
         g_tau_base   = tau_g[:, :6]   # (B,6)
         g_tau_joints = tau_g[:, 6:]   # (B,n)
+        
+        # print(1, bkt[bkt.isnan().any(dim=-1)], self.P_cord[self.P_cord.isnan().any(dim=-1)])
+        # print(2, self.tip_pos[self.tip_pos.isnan().any(dim=-1)], self.tip_pos2[self.tip_pos2.isnan().any(dim=-1)], self.circle_mid[self.circle_mid.isnan().any(dim=-1)])
         
         return f_tau_joints, f_tau_base, g_tau_joints, g_tau_base
     
@@ -978,6 +992,7 @@ class ExcEnv(DirectRLEnv):
 
             dtheta = torch.clamp(theta_E[:, None] - theta, min=0.0)       # [B,K]
             Aseg = 0.5 * (R[:, None]**2) * (dtheta - torch.sin(dtheta))   # [B,K]
+            
             return Atr, Aseg                                             # [B,K], [B,K,2]
 
     def dA_dtheta_world(self, theta):
@@ -1007,18 +1022,17 @@ class ExcEnv(DirectRLEnv):
         return tri_term + seg_term
 
     @torch.no_grad()
-    def solve_theta(self, K: int = 1024, eps: float = 1e-12):
+    def solve_theta(self, K: int = 512, eps: float = 1e-12):
         """테이블 룩업 → 선형보간 → 뉴턴 1회 (월드)"""
         # θ 그리드
         EC = self.tip_pos2 - self.circle_mid
         theta_E   = torch.atan2(EC[..., 1], EC[..., 0])    # [B]
-        theta_max = theta_E - torch.pi
 
         w = torch.linspace(0.0, 1.0, K, device=theta_E.device, dtype=theta_E.dtype)
-        theta_grid = theta_E[:, None] + (theta_max - theta_E)[:, None] * w[None, :]  # [B,K]
+        theta_grid = theta_E[:, None] - torch.pi * w[None, :]  # [B,K]
         Atr_grid, Aseg_grid = self.A_of_theta_world(theta_grid, theta_E)
         A_grid = Atr_grid + Aseg_grid
-
+    
         # 타깃 면적 클램프
         #A_tgt = self.fill_ratio
         A_tgt = self.fill_ratio* (0.5 * torch.pi * self.bucket_circle**2 + self.plate_height * self.bucket_circle)
@@ -1046,6 +1060,9 @@ class ExcEnv(DirectRLEnv):
         R = self.ensure_B(self.bucket_circle, P_theta.shape[0], P_theta.device, P_theta.dtype)
         C = self.ensure_B2(self.circle_mid, P_theta.shape[0], P_theta.device, P_theta.dtype)
         P = C + torch.stack([R * torch.cos(P_theta), R * torch.sin(P_theta)], dim=-1)
+        
+        # print("theta",theta[P.isnan().any(dim=-1)])
+        # print(theta)
         
         self.P_cord = P
         self.max_L  = torch.norm(P, dim=-1)
